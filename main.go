@@ -1,16 +1,10 @@
 package main
 
 import (
-	"fmt"
 	"log"
-	"os"
 	"strconv"
+	"strings"
 	"time"
-
-	"github.com/adshao/go-binance/v2"
-	"github.com/joho/godotenv"
-	"github.com/suquant/kucoin-go-sdk/kucoin"
-	"github.com/markcheno/go-talib"
 )
 
 const (
@@ -24,7 +18,7 @@ var (
 )
 
 func main() {
-	// Load environment variables
+    // Load environment variables
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatal("Error loading .env file")
@@ -41,80 +35,52 @@ func main() {
 	}
 }
 
-func checkMarketCondition() bool {
-	// Get market data
-	klines, err := client.Klines(tradingSymbol, timeFrame, 100)
+func Buy(client *KuCoinClient, tradingSymbol string) error {
+	ticker := strings.Split(tradingSymbol, "/")[0]
+	balance, err := GetBalance(client, "USDT")
 	if err != nil {
-		log.Fatalf("Failed to get klines: %v", err)
+		return err
 	}
 
-	// Calculate MACD and SMA
-	macd, signal, _ := talib.Macd(klines.Close, 12, 26, 9)
-	sma, _ := talib.Sma(klines.Close, 20)
+	if balance.Free == "0" {
+		log.Println("No USDT to buy")
+		return nil
+	}
 
-	// Check condition
-	return macd[len(macd)-1] < signal[len(signal)-1] && sma[len(sma)-1] > sma[len(sma)-2]
+	price, err := GetTickerPrice(client, tradingSymbol)
+	if err != nil {
+		return err
+	}
+
+	orderPrice := price * 1.01 // Buy at 1% above market price
+
+	orderSize := (FloatFromString(balance.Free) / FloatFromString(price)) * 0.99 // Buy 99% of available balance
+
+	log.Printf("Buying %v %s at %v USDT/%s...\n", orderSize, ticker, orderPrice, ticker)
+
+	orderId, err := client.PlaceLimitBuyOrder(tradingSymbol, orderSize, orderPrice)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("Order placed: %v\n", orderId)
+
+	return nil
 }
 
-func checkBalance() {
-	// Get USDT balance
-	accounts, err := client.AccountList()
-	if err != nil {
-		log.Fatalf("Failed to get account list: %v", err)
-	}
-	for _, account := range accounts {
-		if account.Currency == "USDT" && account.Type == "trade" {
-			usdtBalance, err = strconv.ParseFloat(account.Available, 64)
-			if err != nil {
-				log.Fatalf("Failed to parse USDT balance: %v", err)
-			}
-			break
-		}
-	}
-}
-
-func buy() {
-	// Check market condition
-	if !checkMarketCondition() {
-		return
-	}
-
-	// Check balance
-	checkBalance()
-	if usdtBalance <= 0 {
-		return
-	}
-
-	// Calculate order size based on available USDT balance
-	price, err := client.GetLastPrice(tradingSymbol)
-	if err != nil {
-		log.Fatalf("Failed to get last price: %v", err)
-	}
-	orderSize := usdtBalance / price
-
-	// Place buy order
-	order, err := client.CreateOrder(tradingSymbol, kucoin.BUY, "", fmt.Sprintf("%.8f", orderSize), fmt.Sprintf("%.8f", price))
-	if err != nil {
-		log.Fatalf("Failed to place buy order: %v", err)
-	}
-	log.Printf("Placed buy order: %v", order)
-
-	// Update USDT balance
-	usdtBalance -= orderSize * price
-}
-
-func sell(client *KuCoinClient, ticker string) error {
+func Sell(client *KuCoinClient, tradingSymbol string) error {
+	ticker := strings.Split(tradingSymbol, "/")[0]
 	balance, err := GetBalance(client, ticker)
 	if err != nil {
 		return err
 	}
 
 	if balance.Free == "0" {
-		log.Println("No ETH to sell")
+		log.Printf("No %s to sell", ticker)
 		return nil
 	}
 
-	price, err := GetTickerPrice(client, ticker)
+	price, err := GetTickerPrice(client, tradingSymbol)
 	if err != nil {
 		return err
 	}
@@ -126,9 +92,9 @@ func sell(client *KuCoinClient, ticker string) error {
 		return err
 	}
 
-	log.Printf("Selling %v ETH at %v USDT/ETH...\n", orderSize, orderPrice)
+	log.Printf("Selling %v %s at %v USDT/%s...\n", orderSize, ticker, orderPrice, ticker)
 
-	orderId, err := client.PlaceLimitSellOrder(ticker, orderSize, orderPrice)
+	orderId, err := client.PlaceLimitSellOrder(tradingSymbol, orderSize, orderPrice)
 	if err != nil {
 		return err
 	}
@@ -136,5 +102,42 @@ func sell(client *KuCoinClient, ticker string) error {
 	log.Printf("Order placed: %v\n", orderId)
 
 	return nil
+}
+
+func GetBalance(client *KuCoinClient, currency string) (*Balance, error) {
+	account, err := client.GetAccount()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, balance := range account.Balances {
+		if balance.Currency == currency {
+			return &balance, nil
+		}
+	}
+
+	return nil, fmt.Errorf("balance for %s not found", currency)
+}
+
+func checkMarketCondition(client *KuCoinClient, tradingSymbol string) (bool, error) {
+	ohlcv, err := client.GetKlines(tradingSymbol, "15min", 50)
+	if err != nil {
+		return false, err
+	}
+
+	// Calculate the MACD indicator
+	macd, err := talib.Macd(ohlcv.Close, 12, 26, 9)
+	if err != nil {
+		return false, err
+	}
+
+	// Calculate the 10-period simple moving average
+	sma10, err := talib.Sma(ohlcv.Close, 10)
+	if err != nil {
+		return false, err
+	}
+
+	// Check if MACD is below zero and the SMA10 is above the last candle's close
+	return macd.MACD[len(macd.MACD)-1] < 0 && sma10[len(sma10)-1] > ohlcv.Close[len(ohlcv.Close)-1], nil
 }
 
